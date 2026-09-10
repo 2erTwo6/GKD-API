@@ -4,6 +4,7 @@
 
 - 客户端只需支持 **OpenAI 格式**（`/v1/chat/completions`、`/v1/models`）
 - 上游真实模型支持 **OpenAI 格式**（透传）与 **Gemini Generate Content**（自动双向翻译）
+- **工具调用跨协议适配**：OpenAI 客户端 → Gemini 上游时，`tools`/`tool_choice`/`tool_calls` 历史/`role:"tool"` 消息自动翻译为 Gemini function calling（含 schema 清理、并行调用、tool_call_id 配对），响应侧 functionCall → OpenAI `tool_calls`（流式经 terminal chunk 输出）
 - 支持流式（SSE）与非流式，多模态图片（base64 / URL）
 - 单二进制部署（前端已内嵌），SQLite 存储，无需外部依赖
 
@@ -118,6 +119,8 @@ web               React + Vite + AntD 管理后台（go:embed 内嵌）
 
 ## 已知限制（v1）
 
-- 跨协议（OpenAI 客户端 → Gemini 上游）暂不支持 tools/function calling；同协议透传不受影响
+- 同协议透传（OpenAI → OpenAI）完整保留 tools 等所有字段；跨协议（→ Gemini）的 function calling 已支持常规场景，但以下特性未实现：
+  - Gemini 3 流式 partial-args（`functionCall.willContinue` / `partialArgs`）不重建，不完整调用会被丢弃
+  - Gemini `thoughtSignature` 不透传回上游（多轮对话签名校验可能报错时，移除该模型或使用同协议透传）
 - Gemini 上游图片 URL 会由网关下载后转 base64（生成请求的额外延迟）
 - 竞速落选请求会在胜者确定后立即取消，但上游计费取决于各家对中断请求的策略

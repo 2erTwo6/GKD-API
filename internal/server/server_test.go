@@ -365,6 +365,209 @@ func TestChatGeminiUpstreamStream(t *testing.T) {
 	}
 }
 
+// fakeGeminiScripted serves a Gemini endpoint with custom payloads.
+func fakeGeminiScripted(t *testing.T, nonStreamResp string, streamChunks []string) (*httptest.Server, <-chan captured) {
+	t.Helper()
+	ch := make(chan captured, 64)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var body map[string]any
+		json.Unmarshal(raw, &body)
+		ch <- captured{Path: r.URL.Path + "?" + r.URL.RawQuery, Header: r.Header.Clone(), Body: body}
+		p := r.URL.Path
+		switch {
+		case strings.HasSuffix(p, ":generateContent"):
+			w.Header().Set("Content-Type", "application/json")
+			io.WriteString(w, nonStreamResp)
+		case strings.HasSuffix(p, ":streamGenerateContent"):
+			w.Header().Set("Content-Type", "text/event-stream")
+			for _, c := range streamChunks {
+				io.WriteString(w, "data: "+c+"\n\n")
+			}
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv, ch
+}
+
+func TestChatGeminiToolsRoundTrip(t *testing.T) {
+	srv, _ := newTestServer(t)
+	token := getToken(t, srv)
+	key, _ := createKey(t, srv, token)
+
+	// ---------- round 1: declare tools, upstream returns a function call ----------
+	call := `{"candidates":[{"content":{"parts":[{"text":"让我查一下"},{"functionCall":{"name":"get_weather","args":{"city":"北京"},"id":"g-1"}}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":8,"totalTokenCount":18}}`
+	up, upCh := fakeGeminiScripted(t, call, nil)
+	vmID := createVirtualModel(t, srv, token, `{"name":"gmix-tools","pick_mode":"fastest"}`)
+	rm1 := addRealModel(t, srv, token, vmID, `{"name":"gm-x","base_url":"`+up.URL+`","api_key":"gkey","protocol":"gemini","weight":1}`)
+
+	code, respBody := postJSON(t, srv.URL+"/v1/chat/completions", key,
+		`{"model":"gmix-tools","messages":[{"role":"user","content":"北京天气如何"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"查询城市天气","parameters":{"type":"object","properties":{"city":{"type":"string","description":"城市名","$schema":"http://x"}},"required":["city"],"$schema":"http://json-schema","additionalProperties":false}}}]}`)
+	if code != 200 {
+		t.Fatalf("chat: %d %s", code, respBody)
+	}
+	var completion map[string]any
+	json.Unmarshal([]byte(respBody), &completion)
+	choice := completion["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("finish_reason must be tool_calls: %v", choice["finish_reason"])
+	}
+	msg := choice["message"].(map[string]any)
+	if msg["content"] != "让我查一下" {
+		t.Fatalf("content: %v", msg["content"])
+	}
+	tcs := msg["tool_calls"].([]any)
+	if len(tcs) != 1 {
+		t.Fatalf("tool_calls: %v", msg)
+	}
+	tc := tcs[0].(map[string]any)
+	if tc["id"] != "g-1" {
+		t.Fatalf("call id: %v", tc)
+	}
+	fn := tc["function"].(map[string]any)
+	if fn["name"] != "get_weather" || fn["arguments"] != `{"city":"北京"}` {
+		t.Fatalf("function: %v", fn)
+	}
+
+	// upstream request must carry cleaned functionDeclarations
+	upReq := <-upCh
+	tools := upReq.Body["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("upstream tools: %v", upReq.Body)
+	}
+	decls := tools[0].(map[string]any)["functionDeclarations"].([]any)
+	if len(decls) != 1 {
+		t.Fatalf("declarations: %v", tools)
+	}
+	decl := decls[0].(map[string]any)
+	if decl["name"] != "get_weather" || decl["description"] != "查询城市天气" {
+		t.Fatalf("decl: %v", decl)
+	}
+	params := decl["parameters"].(map[string]any)
+	if params["type"] != "OBJECT" {
+		t.Fatalf("schema type: %v", params)
+	}
+	if _, has := params["$schema"]; has {
+		t.Fatal("$schema must be stripped")
+	}
+	city := params["properties"].(map[string]any)["city"].(map[string]any)
+	if city["type"] != "STRING" {
+		t.Fatalf("city schema: %v", city)
+	}
+	if _, has := city["$schema"]; has {
+		t.Fatal("nested $schema must be stripped")
+	}
+
+	// ---------- round 2: tool result goes back as functionResponse ----------
+	// disable round-1 upstream so the race deterministically hits round-2's mock
+	adminCall(t, srv, token, http.MethodPut, "/api/admin/real-models/"+numStr(rm1), `{"enabled":false}`)
+	result := `{"candidates":[{"content":{"parts":[{"text":"北京现在25度"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":4,"totalTokenCount":16}}`
+	up2, upCh2 := fakeGeminiScripted(t, result, nil)
+	addRealModel(t, srv, token, vmID, `{"name":"gm-x2","base_url":"`+up2.URL+`","api_key":"gkey","protocol":"gemini","weight":1}`)
+
+	secondReq := `{"model":"gmix-tools","messages":[
+		{"role":"user","content":"北京天气如何"},
+		{"role":"assistant","content":"","tool_calls":[{"id":"g-1","type":"function","function":{"name":"get_weather","arguments":"{\"city\":\"北京\"}"}}]},
+		{"role":"tool","tool_call_id":"g-1","content":"{\"temp\":25}"}
+	]}`
+	code, respBody = postJSON(t, srv.URL+"/v1/chat/completions", key, secondReq)
+	if code != 200 {
+		t.Fatalf("chat2: %d %s", code, respBody)
+	}
+	json.Unmarshal([]byte(respBody), &completion)
+	choice = completion["choices"].([]any)[0].(map[string]any)
+	if choice["message"].(map[string]any)["content"] != "北京现在25度" {
+		t.Fatalf("round2 content: %v", choice["message"])
+	}
+
+	upReq2 := <-upCh2
+	contents := upReq2.Body["contents"].([]any)
+	if len(contents) != 3 {
+		t.Fatalf("round2 contents: %v", upReq2.Body)
+	}
+	modelContent := contents[1].(map[string]any)
+	if modelContent["role"] != "model" {
+		t.Fatalf("assistant must map to model: %v", modelContent)
+	}
+	callPart := modelContent["parts"].([]any)[0].(map[string]any)["functionCall"].(map[string]any)
+	if callPart["name"] != "get_weather" {
+		t.Fatalf("functionCall part: %v", callPart)
+	}
+	if callPart["args"].(map[string]any)["city"] != "北京" {
+		t.Fatalf("functionCall args: %v", callPart)
+	}
+	respContent := contents[2].(map[string]any)
+	if respContent["role"] != "user" {
+		t.Fatalf("tool response must be user role: %v", respContent)
+	}
+	fr := respContent["parts"].([]any)[0].(map[string]any)["functionResponse"].(map[string]any)
+	if fr["name"] != "get_weather" {
+		t.Fatalf("functionResponse name: %v", fr)
+	}
+	if fr["id"] != "g-1" {
+		t.Fatalf("functionResponse id: %v", fr)
+	}
+	if fr["response"].(map[string]any)["temp"] != float64(25) {
+		t.Fatalf("functionResponse body: %v", fr)
+	}
+}
+
+func TestChatGeminiToolsStream(t *testing.T) {
+	srv, _ := newTestServer(t)
+	token := getToken(t, srv)
+	key, _ := createKey(t, srv, token)
+
+	stream := []string{
+		`{"candidates":[{"content":{"parts":[{"text":"查询中"}],"role":"model"}}]}`,
+		`{"candidates":[{"content":{"parts":[{"functionCall":{"name":"get_weather","args":{"city":"上海"},"id":"g-9"}}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":6,"totalTokenCount":11}}`,
+	}
+	up, _ := fakeGeminiScripted(t, "{}", stream)
+	vmID := createVirtualModel(t, srv, token, `{"name":"gmix-stream","pick_mode":"fastest"}`)
+	addRealModel(t, srv, token, vmID, `{"name":"gm-x","base_url":"`+up.URL+`","api_key":"gkey","protocol":"gemini","weight":1}`)
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions",
+		strings.NewReader(`{"model":"gmix-stream","stream":true,"messages":[{"role":"user","content":"上海天气"}],"tools":[{"type":"function","function":{"name":"get_weather"}}]}`))
+	req.Header.Set("Authorization", "Bearer "+key)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer res.Body.Close()
+	raw, _ := io.ReadAll(res.Body)
+	s := string(raw)
+
+	if !strings.Contains(s, `"tool_calls"`) || !strings.Contains(s, `"get_weather"`) {
+		t.Fatalf("stream must carry tool_calls delta: %s", s)
+	}
+	if !strings.Contains(s, `"content":"查询中"`) {
+		t.Fatalf("stream text missing: %s", s)
+	}
+	if !strings.Contains(s, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("terminal finish must be tool_calls: %s", s)
+	}
+	if !strings.Contains(s, "data: [DONE]") {
+		t.Fatalf("missing [DONE]: %s", s)
+	}
+	// the tool delta chunk must not carry finish_reason
+	for _, line := range strings.Split(s, "\n") {
+		if !strings.HasPrefix(line, "data: ") || strings.Contains(line, "[DONE]") {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(strings.TrimPrefix(line, "data: ")), &m) != nil {
+			continue
+		}
+		choice := m["choices"].([]any)[0].(map[string]any)
+		if _, hasTools := choice["delta"].(map[string]any)["tool_calls"]; hasTools && choice["finish_reason"] != nil {
+			t.Fatalf("tool delta chunk must not carry finish_reason: %s", line)
+		}
+	}
+}
+
 func TestChatFailures(t *testing.T) {
 	srv, _ := newTestServer(t)
 	token := getToken(t, srv)

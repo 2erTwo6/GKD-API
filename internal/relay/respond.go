@@ -105,10 +105,10 @@ func pumpRaw(c *gin.Context, rd *bufio.Reader) {
 }
 
 // pumpGeminiStream converts a Gemini SSE stream (data: {...}) into OpenAI
-// chat.completion.chunk format, terminating with "data: [DONE]".
+// chunk format, terminating with "data: [DONE]".
 func pumpGeminiStream(c *gin.Context, virtualName string, rd *bufio.Reader) {
 	flusher, _ := c.Writer.(http.Flusher)
-	roleSent := false
+	conv := translate.NewStreamConverter(virtualName)
 
 	emit := func(payload []byte) bool {
 		if _, err := c.Writer.Write([]byte("data: ")); err != nil {
@@ -142,12 +142,11 @@ func pumpGeminiStream(c *gin.Context, virtualName string, rd *bufio.Reader) {
 		if err := json.Unmarshal([]byte(payload), &g); err != nil {
 			return true
 		}
-		jb, done, err := translate.GeminiChunkToOpenAI(virtualName, &g, &roleSent)
-		if err != nil {
-			return true
-		}
-		if !emit(jb) {
-			return false
+		chunks, done := conv.Convert(&g)
+		for _, ch := range chunks {
+			if !emit(ch) {
+				return false
+			}
 		}
 		if done {
 			emit([]byte("[DONE]"))
@@ -170,7 +169,8 @@ func pumpGeminiStream(c *gin.Context, virtualName string, rd *bufio.Reader) {
 			return
 		}
 	}
-	if roleSent {
-		emit([]byte("[DONE]"))
+	if ch, _ := conv.Finish(); len(ch) > 0 {
+		emit(ch)
 	}
+	emit([]byte("[DONE]"))
 }
