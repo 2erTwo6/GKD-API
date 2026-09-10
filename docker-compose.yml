@@ -1,0 +1,14 @@
+services:
+  gkd-api:
+    image: ghcr.io/2ertwo6/gkd-api:latest
+    container_name: gkd-api
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - gkd-data:/data
+    # 如需固定初始管理员密码（仅首次启动生效），取消注释：
+    # environment:
+    #   GKD_ADMIN_PASSWORD: your-password
+volumes:
+  gkd-data:

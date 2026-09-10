@@ -43,6 +43,28 @@ make build          # 构建前端 + 单二进制 gkd-api
 | `GKD_DB` | gkd-api.db | SQLite 路径 |
 | `GKD_ADMIN_PASSWORD` | 随机生成 | 首次启动的管理员密码 |
 
+## Docker
+
+镜像由 GitHub Actions 自动构建并推送（多架构 amd64/arm64）：
+
+- 推送到 `main` 分支 → `ghcr.io/2ertwo6/gkd-api:latest` / `:main`
+- 推送 `v*` 标签（如 `v1.2.0`）→ `ghcr.io/2ertwo6/gkd-api:1.2.0`、`:1.2`
+
+```bash
+docker run -d --name gkd-api -p 8787:8787 -v gkd-data:/data ghcr.io/2ertwo6/gkd-api:latest
+
+# 或使用 compose
+docker compose up -d
+```
+
+本地构建（国内网络）：
+
+```bash
+podman build --build-arg GOPROXY=https://goproxy.cn,direct \
+  --build-arg NPM_REGISTRY=https://registry.npmmirror.com \
+  -t gkd-api:local .
+```
+
 ## 客户端调用
 
 ```bash
@@ -82,6 +104,8 @@ cd web && npm run dev   # 前端开发（代理到 :8787）
 ```
 cmd/server        入口
 cmd/mockup        本地假上游（端到端演示用）
+Dockerfile        多阶段构建（node → golang → distroless）
+.github/workflows GitHub Actions：测试 + 自动构建多架构镜像到 GHCR
 internal/config   环境变量配置
 internal/db       GORM 模型与迁移
 internal/auth     JWT 签发/校验

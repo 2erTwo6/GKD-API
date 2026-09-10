@@ -1,0 +1,11 @@
+.git
+.github
+gkd-api
+mockup
+*.db
+*.db-shm
+*.db-wal
+*.log
+README.md
+web/node_modules
+web/dist
